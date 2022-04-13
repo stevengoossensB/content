@@ -8,6 +8,7 @@ import subprocess
 import sys
 import uuid
 import zipfile
+from abc import abstractmethod
 from datetime import datetime
 from packaging.version import Version
 from enum import IntEnum
@@ -69,6 +70,7 @@ XSIAM_BUILD_TYPE = "XSIAM"
 MARKETPLACE_TEST_BUCKET = 'marketplace-ci-build/content/builds'
 MARKETPLACE_XSIAM_BUCKETS = 'marketplace-v2-dist-dev/upload-flow/builds-xsiam'
 ARTIFACTS_FOLDER_MPV2 = "/builds/xsoar/content/artifacts/marketplacev2"
+SET_SERVER_KEYS = True
 
 
 class Running(IntEnum):
@@ -181,6 +183,8 @@ class Build:
 
     def __init__(self, options):
         self._proxy = None
+        self.is_xsiam = False
+        self.xsiam_machine = None
         self.servers = []
         self.server_numeric_version = ''
         self.git_sha1 = options.git_sha1
@@ -235,19 +239,24 @@ class Build:
                 tests_to_run.append(test_clean)
         return tests_to_run
 
+    @abstractmethod
     def configure_servers_and_restart(self):
         pass
 
+    @abstractmethod
     def install_nightly_pack(self):
         pass
 
+    @abstractmethod
     def test_integrations_post_update(self, new_module_instances: list,
                                       modified_module_instances: list) -> tuple:
         pass
 
+    @abstractmethod
     def configure_and_test_integrations_pre_update(self, new_integrations, modified_integrations) -> tuple:
         pass
 
+    @abstractmethod
     def test_integration_with_mock(self, instance: dict, pre_update: bool):
         pass
 
@@ -281,6 +290,7 @@ class Build:
             logging.debug(f'Updated Integrations Since Last Release:\n{modified_integrations_names}')
         return new_integrations_names, modified_integrations_names
 
+    @abstractmethod
     def concurrently_run_function_on_servers(self, function=None, pack_path=None, service_account=None):
         pass
 
@@ -298,7 +308,8 @@ class Build:
         installed_content_packs_successfully = True
         for server in self.servers:
             try:
-                _, flag = search_and_install_packs_and_their_dependencies(pack_ids, server.client)
+                hostname = self.xsiam_machine if self.is_xsiam else ''
+                _, flag = search_and_install_packs_and_their_dependencies(pack_ids, server.client, hostname)
                 if not flag:
                     raise Exception('Failed to search and install packs.')
             except Exception:
@@ -325,9 +336,12 @@ class Build:
                 logging.debug('Not running instance tests in nightly flow')
                 tests_for_iteration = []
             else:
-                tests_for_iteration = [test for test in tests
-                                       if not filtered_tests or test.get('playbookID', '') in filtered_tests]
-
+                # if not filtered_tests in XSIAM, we not running tests at all
+                if self.is_xsiam and not filtered_tests:
+                    tests_for_iteration = []
+                else:
+                    tests_for_iteration = [test for test in tests
+                                           if not filtered_tests or test.get('playbookID', '') in filtered_tests]
             tests_for_iteration = filter_tests_with_incompatible_version(tests_for_iteration, server_numeric_version)
             return tests_for_iteration
 
@@ -686,7 +700,10 @@ class XSOARBuild(Build):
 class XSIAMBuild(Build):
 
     def __init__(self, options):
+        global SET_SERVER_KEYS
+        SET_SERVER_KEYS = False
         super().__init__(options)
+        self.is_xsiam = True
         self.xsiam_machine = options.xsiam_machine
         self.xsiam_servers = get_json_file(options.xsiam_servers_path)
         self.api_key, self.server_numeric_version, self.base_url, self.xdr_auth_id =\
@@ -701,6 +718,10 @@ class XSIAMBuild(Build):
         return conf.get('api_key'), conf.get('demisto_version'), conf.get('base_url'), conf.get('x-xdr-auth-id')
 
     def configure_servers_and_restart(self):
+        # No need of this step in XSIAM.
+        pass
+
+    def test_integration_with_mock(self, instance: dict, pre_update: bool):
         # No need of this step in XSIAM.
         pass
 
@@ -769,8 +790,7 @@ class XSIAMBuild(Build):
     @staticmethod
     def set_marketplace_url(servers, branch_name, ci_build_number):
         logging.info('Copying custom build bucket to xsiam_instance_bucket.')
-        # from_bucket = f'{MARKETPLACE_TEST_BUCKET}/{branch_name}/{ci_build_number}/marketplacev2/content'
-        from_bucket = f'{MARKETPLACE_TEST_BUCKET}/xsiam-build-instances/2625991/marketplacev2/content'
+        from_bucket = f'{MARKETPLACE_TEST_BUCKET}/{branch_name}/{ci_build_number}/marketplacev2/content'
         output_file = f'{ARTIFACTS_FOLDER_MPV2}/Copy_custom_bucket_to_xsiam_machine.log'
         for server in servers:
             to_bucket = f'{MARKETPLACE_XSIAM_BUCKETS}/{server.name}'
@@ -1144,7 +1164,7 @@ def __set_server_keys(client, integration_params, integration_name):
         integration_name (str): The name of the integration which the server configurations keys are related to.
 
     """
-    if 'server_keys' not in integration_params:
+    if 'server_keys' not in integration_params or not SET_SERVER_KEYS:
         return
 
     logging.info(f'Setting server keys for integration: {integration_name}')
@@ -1562,41 +1582,51 @@ def create_build_object() -> Build:
 
 
 def main():
+    """
+    This step in the build doing different things for branch build and nightly.
+    The flow for custom branch build is:
+        1. Add server config and restart servers (only in xsoar).
+        2. Disable all enabled integrations.
+        3. Finds only modified (not new) packs and install them, same version as in production.
+            (before the update in this branch).
+        4. Compares master to commit_sha and return two lists - new integrations and modified in the current branch.
+        5. Configures integration instances (same version as in production) for the modified packs
+            and runs `test-module` (pre-update).
+        6. Changes marketplace bucket to the new one that was created in create-instances workflow.
+        7. Installs all (new and modified) packs from current branch.
+        8. After updating packs from branch, runs `test-module` for both new and modified integrations,
+            to check that modified integrations was not broken. (post-ipdate).
+        9. Prints results.
+    The flow for nightly:
+        1. Add server config and restart servers (only in xsoar).
+        2. Disable all enabled integrations.
+        3. Upload all test playbooks that currently in master.
+        4. In XSOAR:Install all existing packs, in XSIAM: install only requested packs.
+    """
     install_logging('Install_Content_And_Configure_Integrations_On_Server.log', logger=logging)
     build = create_build_object()
     logging.info(f"Build Number: {build.ci_build_number}")
 
-    # add server config and restart servers
-    build.configure_servers_and_restart()  # only xsoar
-    build.disable_instances()  # disable all enabled integrations
+    build.configure_servers_and_restart()
+    build.disable_instances()
 
     if build.is_nightly:
-        # XSOAR Nightly: install all existing packs and upload all test playbooks that currently in master.
         build.install_nightly_pack()
     else:
-        # Install only modified packs.
         pack_ids = get_non_added_packs_ids(build)
         build.install_packs(pack_ids=pack_ids)
 
-        # compares master to commit_sha and return two lists - new integrations and modified in the current branch
         new_integrations, modified_integrations = build.get_changed_integrations()
 
-        # Test configurations from conf.json that should be run in this execution
-        # Configures integration instances that currently in master (+ press test button)
         pre_update_configuration_results = build.configure_and_test_integrations_pre_update(new_integrations,
                                                                                             modified_integrations)
 
         modified_module_instances, new_module_instances, failed_tests_pre, successful_tests_pre = pre_update_configuration_results
 
-        # Changes marketplace bucket to the new one that was created. Installs all (new and modified)
-        # required packs from current branch.
         installed_content_packs_successfully = build.update_content_on_servers()
 
-        # After updating packs from branch, runs `test-module` for both new and modified integrations,
-        # to check that modified integrations was not broken. Wrapper for `instance_testing` function.
         successful_tests_post, failed_tests_post = build.test_integrations_post_update(new_module_instances,
                                                                                        modified_module_instances)
-        # prints results
         success = report_tests_status(failed_tests_pre, failed_tests_post, successful_tests_pre, successful_tests_post,
                                       new_integrations, build)
         if not success or not installed_content_packs_successfully:
